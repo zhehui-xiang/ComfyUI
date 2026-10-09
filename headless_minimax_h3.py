@@ -13,6 +13,16 @@ import time
 import uuid
 
 
+def log_timing(label, begin_ns, end_ns):
+    elapsed_ns = end_ns - begin_ns
+    logging.getLogger("headless_timing").info(
+        "PIPELINE TIME: Time taken to %s: %d.%09d sec, begin: %d.%09d, end: %d.%09d",
+        label,
+        *divmod(elapsed_ns, 1_000_000_000),
+        *divmod(begin_ns, 1_000_000_000),
+        *divmod(end_ns, 1_000_000_000),
+    )
+
 def parse_runner_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--workflow", required=True, help="Workflow saved by ComfyUI as API Format JSON")
@@ -70,9 +80,9 @@ class HeadlessServer:
     def send_sync(self, event, data, sid=None):
         if event != "executing" or data.get("node") is None:
             return
-        now = time.perf_counter()
+        now = time.time_ns()
         if self.last_event_time is not None:
-            logging.info("NODE_TIMING node=%s seconds=%.3f", self.timed_node_id, now - self.last_event_time)
+            log_timing(f"NODE_TIMING/ node={self.timed_node_id}", self.last_event_time, now)
         self.timed_node_id = data["node"]
         self.last_event_time = now
 
@@ -105,21 +115,16 @@ async def execute_prompt(executor, prompt, run_number):
     if not valid:
         raise RuntimeError(f"Workflow validation failed: {error['message']}: {error['details']}")
     executor.server.timed_node_id = None
-    executor.server.last_event_time = time.perf_counter()
-    start = time.perf_counter()
+    executor.server.last_event_time = None
+    start = time.time_ns()
     await executor.execute_async(prompt, prompt_id, {"client_id": executor.server.client_id}, outputs)
+    end = time.time_ns()
     if executor.server.timed_node_id is not None:
-        logging.info(
-            "NODE_TIMING last node=%s seconds=%.3f",
-            executor.server.timed_node_id,
-            time.perf_counter() - executor.server.last_event_time,
-        )
-    logging.info(
-        "WORKLOAD_COMPLETE run=%d cached_models=%s success=%s seconds=%.3f",
-        run_number,
-        run_number > 1,
-        executor.success,
-        time.perf_counter() - start,
+        log_timing(f"NODE_TIMING/ last node={executor.server.timed_node_id}", executor.server.last_event_time, end)
+    log_timing(
+        f"WORKLOAD_COMPLETE/ run={run_number} cached_models={run_number > 1} success={executor.success}",
+        start,
+        end,
     )
     if not executor.success:
         raise RuntimeError("Workflow execution failed; inspect execution_error messages above")
@@ -128,12 +133,45 @@ async def execute_prompt(executor, prompt, run_number):
 async def main():
     print("begin of main()", flush=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    timing_logger = logging.getLogger("headless_timing")
+    timing_logger.setLevel(logging.INFO)
+    timing_logger.propagate = False
+    timing_handler = logging.StreamHandler()
+    timing_handler.setFormatter(logging.Formatter("%(message)s"))
+    timing_logger.addHandler(timing_handler)
     configure_paths()
     run_prestartup_scripts()
     from execution import CacheType, PromptExecutor
     import nodes
 
     await nodes.init_extra_nodes(init_custom_nodes=True, init_api_nodes=not getattr(args, "disable_partner_nodes", False))
+    import torch
+    from comfy.ldm.minimax.model import MiniMaxH3Model
+
+    original_forward = MiniMaxH3Model.forward
+    forward_count = 0
+
+    def timed_forward(self, x, timestep, context, *forward_args, **forward_kwargs):
+        nonlocal forward_count
+        forward_count += 1
+        devices = [f"xpu:{i}" for i in range(min(torch.xpu.device_count(), 2))]
+        for device in devices:
+            torch.xpu.synchronize(device)
+        start = time.time_ns()
+        try:
+            return original_forward(self, x, timestep, context, *forward_args, **forward_kwargs)
+        finally:
+            for device in devices:
+                torch.xpu.synchronize(device)
+            log_timing(
+                f"H3_FORWARD/ call={forward_count} video={tuple(x[0].shape)} "
+                f"audio={tuple(x[1].shape)} timestep={tuple(timestep.shape)} "
+                f"context={tuple(context.shape)}",
+                start,
+                time.time_ns(),
+            )
+
+    MiniMaxH3Model.forward = timed_forward
     prompt = load_api_prompt(os.path.abspath(RUNNER_ARGS.workflow))
     executor = PromptExecutor(
         HeadlessServer(),
