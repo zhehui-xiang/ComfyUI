@@ -28,9 +28,14 @@ def parse_runner_args():
     parser.add_argument("--workflow", required=True, help="Workflow saved by ComfyUI as API Format JSON")
     parser.add_argument("--runs", type=int, default=2)
     parser.add_argument("--seed-step", type=int, default=1)
+    parser.add_argument("--profile-h3-forward-dir", help="Export one Chrome trace per selected H3 forward")
+    parser.add_argument("--profile-h3-forward-start", type=int, default=3, help="1-based H3 forward call to start profiling")
+    parser.add_argument("--profile-h3-forward-count", type=int, default=1, help="Number of H3 forwards to profile")
     runner_args, comfy_args = parser.parse_known_args()
     if runner_args.runs < 1:
         parser.error("--runs must be at least 1")
+    if runner_args.profile_h3_forward_start < 1 or runner_args.profile_h3_forward_count < 1:
+        parser.error("H3 profiling start and count must be at least 1")
     sys.argv = [sys.argv[0], *comfy_args]
     return runner_args
 
@@ -150,6 +155,10 @@ async def main():
 
     original_forward = MiniMaxH3Model.forward
     forward_count = 0
+    if RUNNER_ARGS.profile_h3_forward_dir:
+        os.makedirs(RUNNER_ARGS.profile_h3_forward_dir, exist_ok=True)
+        if not hasattr(torch.profiler.ProfilerActivity, "XPU"):
+            raise RuntimeError("This PyTorch build does not expose torch.profiler XPU activity")
 
     def timed_forward(self, x, timestep, context, *forward_args, **forward_kwargs):
         nonlocal forward_count
@@ -158,8 +167,30 @@ async def main():
         for device in devices:
             torch.xpu.synchronize(device)
         start = time.time_ns()
+        profile_start = RUNNER_ARGS.profile_h3_forward_start
+        profile_end = profile_start + RUNNER_ARGS.profile_h3_forward_count
+        should_profile = (
+            RUNNER_ARGS.profile_h3_forward_dir is not None
+            and profile_start <= forward_count < profile_end
+        )
+        profiler = None
         try:
-            return original_forward(self, x, timestep, context, *forward_args, **forward_kwargs)
+            if should_profile:
+                profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.XPU,
+                    ],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=False,
+                )
+                with profiler:
+                    output = original_forward(self, x, timestep, context, *forward_args, **forward_kwargs)
+                    for device in devices:
+                        torch.xpu.synchronize(device)
+            else:
+                output = original_forward(self, x, timestep, context, *forward_args, **forward_kwargs)
         finally:
             for device in devices:
                 torch.xpu.synchronize(device)
@@ -170,6 +201,14 @@ async def main():
                 start,
                 time.time_ns(),
             )
+        if profiler is not None:
+            trace_path = os.path.join(
+                RUNNER_ARGS.profile_h3_forward_dir,
+                f"h3_forward_call_{forward_count:04d}.json",
+            )
+            profiler.export_chrome_trace(trace_path)
+            logging.info("H3_PROFILE_TRACE call=%d path=%s", forward_count, trace_path)
+        return output
 
     MiniMaxH3Model.forward = timed_forward
     prompt = load_api_prompt(os.path.abspath(RUNNER_ARGS.workflow))
