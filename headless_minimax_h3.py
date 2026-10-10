@@ -183,7 +183,7 @@ async def main():
                     ],
                     record_shapes=True,
                     profile_memory=True,
-                    with_stack=False,
+                    with_stack=True,
                 )
                 with profiler:
                     output = original_forward(self, x, timestep, context, *forward_args, **forward_kwargs)
