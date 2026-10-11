@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 在 llm-scaler-omni 容器里执行（ComfyUI 挂在 /workspace/ComfyUI）：
 #   build  : 编译 h3_int8_attn.cpp -> optimize_int8/build/h3_int8_attn.so（源文件没变就跳过）
-#   patch  : 把 patches/*.patch 打到 custom_nodes/ComfyUI-OmniXPU（已打过就跳过，冲突则报错）
-#   revert : 撤掉 patch
+#   patch  : 把 patches/*.patch 打到 custom_nodes/ComfyUI-OmniXPU（已打过就跳过，冲突则报错）；
+#            patch 改的是 ../optimize 融合 patch 之后的 h3_rms_modulation.py，要先打融合 patch
+#   revert : 撤掉 patch（要在 ../optimize/build.sh revert 之前）
 #   all    : build + patch（默认）
 set -euo pipefail
 
@@ -55,7 +56,13 @@ step_patch() {
   for p in "$dir"/patches/*.patch; do
     if git_omnixpu apply --reverse --check "$p" 2>/dev/null; then
       echo "[optimize_int8] already applied: $(basename "$p")"
-    elif git_omnixpu apply --check "$p"; then
+      continue
+    fi
+    for fused in "$comfy_root"/optimize/patches/*.patch; do
+      git_omnixpu apply --reverse --check "$fused" 2>/dev/null ||
+        { echo "[optimize_int8] needs $(basename "$fused") applied first (optimize/build.sh patch)" >&2; exit 1; }
+    done
+    if git_omnixpu apply --check "$p"; then
       git_omnixpu apply "$p"
       echo "[optimize_int8] applied: $(basename "$p")"
     else

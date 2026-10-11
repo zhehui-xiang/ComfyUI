@@ -1,25 +1,33 @@
-diff --git a/adapters/attention.py b/adapters/attention.py
-index a0cb124..17c1a30 100644
---- a/adapters/attention.py
-+++ b/adapters/attention.py
-@@ -19,6 +19,10 @@ _attention_route_counts = {}
- _attention_failed_contracts = set()
- _attention_experimental_warning_emitted = False
- _attention_traced_contracts = set()
-+_h3_int8_ops = None
-+_h3_int8_bf16_blocks = frozenset()
-+_h3_int8_check_left = 0
-+_h3_int8_calls = 0
- 
- _MINIMAX_H3_H56_CUTE_MIN_SEQUENCE = 31
- _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE = 6
-@@ -253,6 +257,47 @@ def _is_minimax_h3_h56_bhld(tensor, seq):
-     )
+diff --git a/adapters/h3_rms_modulation.py b/adapters/h3_rms_modulation.py
+index 18761d9..351f13b 100644
+--- a/adapters/h3_rms_modulation.py
++++ b/adapters/h3_rms_modulation.py
+@@ -36,6 +36,10 @@ _fallback_calls = 0
+ _fallback_reasons: dict[str, int] = {}
+ _fused_block_calls = 0
+ _fused_block_fallbacks: dict[str, int] = {}
++_int8_attn_ops = None
++_int8_attn_bf16_blocks: frozenset[int] = frozenset()
++_int8_attn_check_left = 0
++_int8_attn_calls = 0
  
  
-+def _load_h3_int8_sidecar(comfy_root):
-+    """Load the INT8 QK attention ops built by ComfyUI/optimize_int8/build.sh."""
-+    global _h3_int8_ops, _h3_int8_bf16_blocks, _h3_int8_check_left
+ def _record_fallback(reason: str) -> None:
+@@ -53,6 +57,7 @@ def get_stats() -> dict[str, Any]:
+         "reasons": dict(_fallback_reasons),
+         "fused_block": _fused_block_calls,
+         "fused_block_fallback": dict(_fused_block_fallbacks),
++        "int8_attention": _int8_attn_calls,
+     }
+ 
+ 
+@@ -271,6 +276,26 @@ def _load_fused_sidecar(comfy_root: str) -> str:
+     return ""
+ 
+ 
++def _load_int8_attention_sidecar(comfy_root: str) -> str:
++    """Load the INT8 QK^T attention ops built by ComfyUI/optimize_int8/build.sh."""
++    global _int8_attn_ops, _int8_attn_bf16_blocks, _int8_attn_check_left
 +    if os.environ.get("OMNIXPU_H3_INT8_ATTN", "1") == "0":
 +        return "disabled by env"
 +    path = os.environ.get("OMNIXPU_H3_INT8_ATTN_SO") or os.path.join(
@@ -28,70 +36,130 @@ index a0cb124..17c1a30 100644
 +    if not os.path.isfile(path):
 +        return f"{path} not built"
 +    torch.ops.load_library(path)
-+    _h3_int8_ops = torch.ops.h3i8attn
++    _int8_attn_ops = torch.ops.h3i8attn
 +    # INT8 QK^T flips some tokens of these blocks' sharp heads (worst cos < 0.81 over 20 steps); keep them in bf16.
-+    _h3_int8_bf16_blocks = frozenset(
++    _int8_attn_bf16_blocks = frozenset(
 +        int(b) for b in os.environ.get("OMNIXPU_H3_INT8_ATTN_BF16_BLOCKS", "45,48,49").split(",") if b
 +    )
-+    _h3_int8_check_left = int(os.environ.get("OMNIXPU_H3_INT8_ATTN_CHECK", "0"))
++    _int8_attn_check_left = int(os.environ.get("OMNIXPU_H3_INT8_ATTN_CHECK", "0"))
 +    return ""
 +
 +
-+def _h3_int8_attention(q, k, v, transformer_options):
-+    """INT8 QK^T attention for the H3 DiT blocks; None keeps the bf16 route."""
-+    global _h3_int8_calls, _h3_int8_check_left
-+    if torch.compiler.is_compiling():
-+        return None
-+    block = (transformer_options or {}).get("block_index")
-+    # Only DiT blocks pass Q/K/V that all view one qkv projection (the token refiner does not).
-+    if block is None or block in _h3_int8_bf16_blocks or any(t.stride(2) != 3 * 56 * 128 for t in (q, k, v)):
-+        return None
-+    q8, k8, q_scale, k_scale = _h3_int8_ops.quant_qk(q, k)
-+    out = _h3_int8_ops.fmha(q8, k8, v, q_scale, k_scale)
-+    _h3_int8_calls += 1
-+    if _h3_int8_check_left > 0:
-+        _h3_int8_check_left -= 1
-+        ref = _backend_sdp.sdp_bhld_d128(q, k, v).float()
-+        err = ((out.float() - ref).norm() / ref.norm()).item()
-+        cos = torch.nn.functional.cosine_similarity(out.float(), ref, dim=-1).min().item()
-+        log.info("[OmniXPU] H3 int8 attention check: block=%d rel_err=%.4f min_cos=%.4f", block, err, cos)
-+    return out
-+
-+
- def _is_minimax_h3_vae_d64_bhld(tensor, seq, *, value):
-     try:
-         shape = tuple(tensor.shape)
-@@ -692,6 +737,14 @@ def apply():
+ def _fused_int8_weight(linear: Any, x: torch.Tensor):
+     """Return resident (qdata, scale) of a G256 ConvRot TensorWise INT8 linear."""
+     weight = getattr(linear, "weight", None)
+@@ -327,6 +352,59 @@ def _fused_linear(q, q_scale, weight):
+     return _omni_int8.int8_linear_prequantized(q, q_scale, weight[0], weight[1], None, 2)
  
-     _pytorch_fallback = attn_mod.attention_pytorch
-     wrap_attn = attn_mod.wrap_attn
-+    if target == "bmg" and _backend_name == "cute":
-+        int8_reason = _load_h3_int8_sidecar(
-+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(attn_mod.__file__)))))
-+        )
+ 
++def _bf16_attention(h3_model, attn, qkv, rope_freqs, q_weight, k_weight, transformer_options):
++    """Attention.forward after qkv_proj: rms_rope in place on qkv, then the selected attention."""
++    s = qkv.shape[0]
++    q, k, v = qkv.split(attn.heads * attn.head_dim, dim=-1)
++    q = q.view(1, s, attn.heads, attn.head_dim)
++    k = k.view(1, s, attn.heads, attn.head_dim)
++    v = v.view(s, attn.heads, attn.head_dim)
++    h3_model.comfy.quant_ops.ck.rms_rope_split_half_(
++        q, k, rope_freqs, q_weight, k_weight, epsilon=attn.q_norm.eps, rot_dim=rope_freqs.shape[-3] * 2)
++    container = h3_model.AttentionTensorContainer
++    return h3_model.optimized_attention(
++        container(q[0].transpose(0, 1).unsqueeze(0)),
++        container(k[0].transpose(0, 1).unsqueeze(0)),
++        container(v.transpose(0, 1).unsqueeze(0)),
++        attn.heads, mask=None, skip_reshape=True, transformer_options=transformer_options,
++    ).squeeze(0)
++
++
++def _int8_attention(attn, qkv, rope_freqs, q_weight, k_weight, transformer_options):
++    """INT8 QK^T attention with rms_rope fused into the Q/K quantization; None keeps the bf16 route."""
++    global _int8_attn_calls
++    block = transformer_options.get("block_index")
++    if (
++        _int8_attn_ops is None
++        or torch.compiler.is_compiling()
++        or block is None
++        or block in _int8_attn_bf16_blocks
++        or rope_freqs.dtype != torch.bfloat16
++        or rope_freqs.shape[-3] != 48
++    ):
++        return None
++    s = qkv.shape[0]
++    q, k, v = qkv.split(attn.heads * attn.head_dim, dim=-1)
++    q8, k8, q_scale, k_scale = _int8_attn_ops.rms_rope_quant(
++        q.view(1, s, attn.heads, attn.head_dim), k.view(1, s, attn.heads, attn.head_dim),
++        rope_freqs, q_weight, k_weight, attn.q_norm.eps)
++    v = v.view(1, s, attn.heads, attn.head_dim).transpose(1, 2)
++    _int8_attn_calls += 1
++    return _int8_attn_ops.fmha(q8, k8, v, q_scale, k_scale).transpose(1, 2).reshape(s, -1)
++
++
++def _check_int8_attention(h3_model, attn, qkv, rope_freqs, q_weight, k_weight, transformer_options, out):
++    """Log the INT8 attention error against the bf16 route on a copy of qkv."""
++    global _int8_attn_check_left
++    _int8_attn_check_left -= 1
++    ref = _bf16_attention(h3_model, attn, qkv.clone(), rope_freqs, q_weight, k_weight, transformer_options).float()
++    err = ((out.float() - ref).norm() / ref.norm()).item()
++    cos = torch.nn.functional.cosine_similarity(
++        out.float().view(-1, attn.head_dim), ref.view(-1, attn.head_dim), dim=-1).min().item()
++    log.info("[OmniXPU] norm: H3 int8 attention check block=%d rel_err=%.4f min_cos=%.4f",
++             transformer_options["block_index"], err, cos)
++
++
+ def _run_fused_block(comfy_ops, h3_model, block, x, modulation, segments, rope_freqs, transformer_options):
+     """Run DiTBlock.forward with norm/ConvRot/quant fused ahead of each INT8 projection.
+ 
+@@ -350,25 +428,15 @@ def _run_fused_block(comfy_ops, h3_model, block, x, modulation, segments, rope_f
+     qkv = _fused_linear(q, q_scale, weights["qkv_proj"])
+     del q, q_scale
+ 
+-    # Attention.forward after qkv_proj.
+     s = x.shape[0]
+-    q, k, v = qkv.split(attn.heads * attn.head_dim, dim=-1)
+-    q = q.view(1, s, attn.heads, attn.head_dim)
+-    k = k.view(1, s, attn.heads, attn.head_dim)
+-    v = v.view(s, attn.heads, attn.head_dim)
+-    h3_model.comfy.quant_ops.ck.rms_rope_split_half_(
+-        q, k, rope_freqs,
+-        h3_model.comfy.model_management.cast_to(attn.q_norm.weight, device=x.device),
+-        h3_model.comfy.model_management.cast_to(attn.k_norm.weight, device=x.device),
+-        epsilon=attn.q_norm.eps, rot_dim=rope_freqs.shape[-3] * 2)
+-    container = h3_model.AttentionTensorContainer
+-    out = h3_model.optimized_attention(
+-        container(q[0].transpose(0, 1).unsqueeze(0)),
+-        container(k[0].transpose(0, 1).unsqueeze(0)),
+-        container(v.transpose(0, 1).unsqueeze(0)),
+-        attn.heads, mask=None, skip_reshape=True, transformer_options=transformer_options,
+-    ).squeeze(0)
+-    del qkv, q, k, v
++    q_weight = h3_model.comfy.model_management.cast_to(attn.q_norm.weight, device=x.device)
++    k_weight = h3_model.comfy.model_management.cast_to(attn.k_norm.weight, device=x.device)
++    out = _int8_attention(attn, qkv, rope_freqs, q_weight, k_weight, transformer_options)
++    if out is None:
++        out = _bf16_attention(h3_model, attn, qkv, rope_freqs, q_weight, k_weight, transformer_options)
++    elif _int8_attn_check_left > 0:
++        _check_int8_attention(h3_model, attn, qkv, rope_freqs, q_weight, k_weight, transformer_options, out)
++    del qkv
+     q, q_scale = _fused_ops.rot_quant(out.reshape(s, -1))
+     del out
+     attn_out = _fused_linear(q, q_scale, weights["out_proj"])
+@@ -436,13 +504,17 @@ def apply():
+         return False, reason
+ 
+     _omni_norm = candidate
+-    fused_reason = _load_fused_sidecar(
+-        os.path.dirname(os.path.dirname(os.path.abspath(comfy_ops.__file__)))
+-    )
++    comfy_root = os.path.dirname(os.path.dirname(os.path.abspath(comfy_ops.__file__)))
++    fused_reason = _load_fused_sidecar(comfy_root)
+     if fused_reason:
+         log.info("[OmniXPU] norm: H3 fused block route off (%s)", fused_reason)
+     else:
+         log.info("[OmniXPU] norm: H3 fused block route enabled")
++        int8_reason = _load_int8_attention_sidecar(comfy_root)
 +        if int8_reason:
-+            log.info("[OmniXPU] attention: H3 int8 QK route off (%s)", int8_reason)
++            log.info("[OmniXPU] norm: H3 int8 attention off (%s)", int8_reason)
 +        else:
-+            log.info("[OmniXPU] attention: H3 int8 QK route enabled")
++            log.info("[OmniXPU] norm: H3 int8 attention enabled")
+     accepts_attention = "attention" in inspect.signature(original).parameters
  
-     @wrap_attn
-     def attention_omni(
-@@ -970,9 +1023,15 @@ def apply():
-             )
-             _, q_bhld, k_bhld, v_bhld = bmg_d128_prepared
-             try:
--                out = _backend_sdp.sdp_bhld_d128(
--                    q_bhld, k_bhld, v_bhld
--                )
-+                out = None
-+                if heads == 56 and _h3_int8_ops is not None:
-+                    out = _h3_int8_attention(
-+                        q_bhld, k_bhld, v_bhld, kwargs.get("transformer_options")
-+                    )
-+                if out is None:
-+                    out = _backend_sdp.sdp_bhld_d128(
-+                        q_bhld, k_bhld, v_bhld
-+                    )
-                 if skip_output_reshape:
-                     return out
-                 return out.transpose(1, 2).reshape(
+     @wraps(original)

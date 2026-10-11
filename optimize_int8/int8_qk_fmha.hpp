@@ -3,7 +3,7 @@
 //
 // 基于 sycl-tla applications/flash_attention_v2 的 XeDefault mainloop 和 XeFMHAFwdKernel 改写
 // （非 causal、无 KV cache / paged / varlen），不修改 sycl-tla 本身；epilogue 直接复用 FMHAFwdEpilogue。
-// 量化约定（h3_int8_attn.cpp 的 quant_qk 准备）：
+// 量化约定（h3_int8_attn.cpp 的 rms_rope_quant 准备）：
 //   Q: 逐 token 对称 int8，q_scale [H, Lq]
 //   K: 每个 KV tile（KvTile 个 token）一个 scale，k_scale [H, ceil(Lkv/KvTile)]
 #pragma once
