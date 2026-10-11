@@ -1,0 +1,230 @@
+diff --git a/adapters/h3_rms_modulation.py b/adapters/h3_rms_modulation.py
+index 46abee4..18761d9 100644
+--- a/adapters/h3_rms_modulation.py
++++ b/adapters/h3_rms_modulation.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import inspect
+ import logging
++import os
+ from functools import wraps
+ from typing import Any, Callable
+ 
+@@ -18,10 +19,23 @@ _PATCH_MARKER = "__omnixpu_h3_rms_modulation_original__"
+ _HIDDEN_SIZE = 5376
+ _MODULATION_EXPAND = 6
+ _MAX_SEGMENTS = 8
++_ATTENTION_SIZE = 7168
++_FFN_SIZE = 14336
++# Projections whose inputs the h3fuse sidecar rotates and quantizes in one pass.
++_FUSED_WEIGHT_SHAPES = {
++    "qkv_proj": (3 * _ATTENTION_SIZE, _HIDDEN_SIZE),
++    "out_proj": (_HIDDEN_SIZE, _ATTENTION_SIZE),
++    "fc1": (2 * _FFN_SIZE, _HIDDEN_SIZE),
++    "fc2": (_HIDDEN_SIZE, _FFN_SIZE),
++}
+ _omni_norm = None
++_omni_int8 = None
++_fused_ops = None
+ _routed_calls = 0
+ _fallback_calls = 0
+ _fallback_reasons: dict[str, int] = {}
++_fused_block_calls = 0
++_fused_block_fallbacks: dict[str, int] = {}
+ 
+ 
+ def _record_fallback(reason: str) -> None:
+@@ -37,6 +51,8 @@ def get_stats() -> dict[str, Any]:
+         "routed": _routed_calls,
+         "fallback": _fallback_calls,
+         "reasons": dict(_fallback_reasons),
++        "fused_block": _fused_block_calls,
++        "fused_block_fallback": dict(_fused_block_fallbacks),
+     }
+ 
+ 
+@@ -231,6 +247,149 @@ def _rms_modulation(
+     return original_modulate(layer(x), shift, scale, segments), 0
+ 
+ 
++def _load_fused_sidecar(comfy_root: str) -> str:
++    """Load the h3fuse ops built by ComfyUI/optimize/build.sh."""
++    global _omni_int8, _fused_ops
++    if os.environ.get("OMNIXPU_H3_FUSED", "1") == "0":
++        return "disabled by env"
++    path = os.environ.get("OMNIXPU_H3_FUSED_SO") or os.path.join(
++        comfy_root, "optimize", "build", "h3_fused.so"
++    )
++    if not os.path.isfile(path):
++        return f"{path} not built"
++    from omni_xpu_kernel import int8 as omni_int8
++
++    native = omni_int8._get_native()
++    if native is None or not hasattr(native, "int8_linear_prequantized"):
++        return "native int8_linear_prequantized is unavailable"
++    try:
++        torch.ops.load_library(path)
++    except (OSError, RuntimeError) as error:
++        return f"cannot load {path}: {error}"
++    _omni_int8 = native
++    _fused_ops = torch.ops.h3fuse
++    return ""
++
++
++def _fused_int8_weight(linear: Any, x: torch.Tensor):
++    """Return resident (qdata, scale) of a G256 ConvRot TensorWise INT8 linear."""
++    weight = getattr(linear, "weight", None)
++    params = getattr(weight, "_params", None)
++    qdata = getattr(weight, "_qdata", None)
++    scale = getattr(params, "scale", None)
++    if (
++        getattr(weight, "_layout_cls", None) != "TensorWiseINT8Layout"
++        or getattr(linear, "bias", None) is not None
++        or len(getattr(linear, "weight_function", ())) > 0
++        or len(getattr(linear, "bias_function", ())) > 0
++        or getattr(linear, "comfy_force_cast_weights", False)
++        or getattr(linear, "_full_precision_mm", False)
++        or not isinstance(qdata, torch.Tensor)
++        or not isinstance(scale, torch.Tensor)
++        or qdata.device != x.device
++        or scale.device != x.device
++        or scale.dtype != torch.float32
++        or getattr(params, "orig_dtype", None) != x.dtype
++        or getattr(params, "transposed", False)
++        or not getattr(params, "convrot", False)
++        or getattr(params, "convrot_groupsize", 256) != 256
++    ):
++        return None
++    return qdata, scale
++
++
++def _fused_block_reason(block: Any, x: torch.Tensor, h3_model: Any, rope_freqs: Any):
++    if rope_freqs is None:
++        return "no_rope", None
++    # A replaced Attention/MLP forward (e.g. sparse attention) must keep running.
++    for module in (block.attn, block.mlp):
++        if type(module).forward.__module__ != h3_model.__name__:
++            return "patched_submodule", None
++    weights = {}
++    for name, linear in (
++        ("qkv_proj", block.attn.qkv_proj),
++        ("out_proj", block.attn.out_proj),
++        ("fc1", block.mlp.fc1),
++        ("fc2", block.mlp.fc2),
++    ):
++        weight = _fused_int8_weight(linear, x)
++        if weight is None or tuple(weight[0].shape) != _FUSED_WEIGHT_SHAPES[name]:
++            return f"{name}_weight", None
++        weights[name] = weight
++    for name in ("norm1", "norm2"):
++        layer = getattr(block, name)
++        if _weight_reason(layer.weight, layer.bias, x) or len(getattr(layer, "weight_function", ())) > 0:
++            return f"{name}_weight", None
++    return "", weights
++
++
++def _fused_linear(q, q_scale, weight):
++    return _omni_int8.int8_linear_prequantized(q, q_scale, weight[0], weight[1], None, 2)
++
++
++def _run_fused_block(comfy_ops, h3_model, block, x, modulation, segments, rope_freqs, transformer_options):
++    """Run DiTBlock.forward with norm/ConvRot/quant fused ahead of each INT8 projection.
++
++    Returns None, before the residual stream is touched, when the block does not
++    match the sidecar contract.
++    """
++    global _fused_block_calls
++    reason, weights = _fused_block_reason(block, x, h3_model, rope_freqs)
++    if reason:
++        if not torch.compiler.is_compiling():
++            _fused_block_fallbacks[reason] = _fused_block_fallbacks.get(reason, 0) + 1
++        return None
++
++    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation
++    starts, stops, rows = (list(column) for column in zip(*segments))
++    attn = block.attn
++    comfy_ops.run_every_op()
++    q, q_scale = _fused_ops.norm_rot_quant(
++        x, block.norm1.weight, scale_msa.to(x.dtype), shift_msa.to(x.dtype),
++        starts, stops, rows, 1e-6 if block.norm1.eps is None else block.norm1.eps, None, None)
++    qkv = _fused_linear(q, q_scale, weights["qkv_proj"])
++    del q, q_scale
++
++    # Attention.forward after qkv_proj.
++    s = x.shape[0]
++    q, k, v = qkv.split(attn.heads * attn.head_dim, dim=-1)
++    q = q.view(1, s, attn.heads, attn.head_dim)
++    k = k.view(1, s, attn.heads, attn.head_dim)
++    v = v.view(s, attn.heads, attn.head_dim)
++    h3_model.comfy.quant_ops.ck.rms_rope_split_half_(
++        q, k, rope_freqs,
++        h3_model.comfy.model_management.cast_to(attn.q_norm.weight, device=x.device),
++        h3_model.comfy.model_management.cast_to(attn.k_norm.weight, device=x.device),
++        epsilon=attn.q_norm.eps, rot_dim=rope_freqs.shape[-3] * 2)
++    container = h3_model.AttentionTensorContainer
++    out = h3_model.optimized_attention(
++        container(q[0].transpose(0, 1).unsqueeze(0)),
++        container(k[0].transpose(0, 1).unsqueeze(0)),
++        container(v.transpose(0, 1).unsqueeze(0)),
++        attn.heads, mask=None, skip_reshape=True, transformer_options=transformer_options,
++    ).squeeze(0)
++    del qkv, q, k, v
++    q, q_scale = _fused_ops.rot_quant(out.reshape(s, -1))
++    del out
++    attn_out = _fused_linear(q, q_scale, weights["out_proj"])
++
++    # x += gate_msa * attn_out in place (as _mod_gate), fused with norm2.
++    comfy_ops.run_every_op()
++    q, q_scale = _fused_ops.norm_rot_quant(
++        x, block.norm2.weight, scale_mlp.to(x.dtype), shift_mlp.to(x.dtype),
++        starts, stops, rows, 1e-6 if block.norm2.eps is None else block.norm2.eps,
++        attn_out, gate_msa.to(x.dtype))
++    del attn_out
++    hidden = _fused_linear(q, q_scale, weights["fc1"])
++    q, q_scale = _fused_ops.silu_mul_rot_quant(hidden)
++    del hidden
++    mlp_out = _fused_linear(q, q_scale, weights["fc2"])
++    del q, q_scale
++    if not torch.compiler.is_compiling():
++        _fused_block_calls += 1
++    return h3_model._mod_gate(x, gate_mlp, mlp_out, segments)
++
++
+ def apply():
+     global _omni_norm
+ 
+@@ -277,6 +436,13 @@ def apply():
+         return False, reason
+ 
+     _omni_norm = candidate
++    fused_reason = _load_fused_sidecar(
++        os.path.dirname(os.path.dirname(os.path.abspath(comfy_ops.__file__)))
++    )
++    if fused_reason:
++        log.info("[OmniXPU] norm: H3 fused block route off (%s)", fused_reason)
++    else:
++        log.info("[OmniXPU] norm: H3 fused block route enabled")
+     accepts_attention = "attention" in inspect.signature(original).parameters
+ 
+     @wraps(original)
+@@ -327,6 +493,20 @@ def apply():
+             gate_mlp,
+         ) = modulation
+ 
++        if not reason and attention is None and _fused_ops is not None:
++            output = _run_fused_block(
++                comfy_ops,
++                h3_model,
++                self,
++                x,
++                modulation,
++                mod_segments,
++                rope_freqs,
++                transformer_options,
++            )
++            if output is not None:
++                return output
++
+         h, first_fused = _rms_modulation(
+             comfy_ops,
+             h3_model._mod_scale_shift,

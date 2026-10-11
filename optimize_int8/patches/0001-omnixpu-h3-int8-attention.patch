@@ -1,0 +1,97 @@
+diff --git a/adapters/attention.py b/adapters/attention.py
+index a0cb124..17c1a30 100644
+--- a/adapters/attention.py
++++ b/adapters/attention.py
+@@ -19,6 +19,10 @@ _attention_route_counts = {}
+ _attention_failed_contracts = set()
+ _attention_experimental_warning_emitted = False
+ _attention_traced_contracts = set()
++_h3_int8_ops = None
++_h3_int8_bf16_blocks = frozenset()
++_h3_int8_check_left = 0
++_h3_int8_calls = 0
+ 
+ _MINIMAX_H3_H56_CUTE_MIN_SEQUENCE = 31
+ _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE = 6
+@@ -253,6 +257,47 @@ def _is_minimax_h3_h56_bhld(tensor, seq):
+     )
+ 
+ 
++def _load_h3_int8_sidecar(comfy_root):
++    """Load the INT8 QK attention ops built by ComfyUI/optimize_int8/build.sh."""
++    global _h3_int8_ops, _h3_int8_bf16_blocks, _h3_int8_check_left
++    if os.environ.get("OMNIXPU_H3_INT8_ATTN", "1") == "0":
++        return "disabled by env"
++    path = os.environ.get("OMNIXPU_H3_INT8_ATTN_SO") or os.path.join(
++        comfy_root, "optimize_int8", "build", "h3_int8_attn.so"
++    )
++    if not os.path.isfile(path):
++        return f"{path} not built"
++    torch.ops.load_library(path)
++    _h3_int8_ops = torch.ops.h3i8attn
++    # INT8 QK^T flips some tokens of these blocks' sharp heads (worst cos < 0.81 over 20 steps); keep them in bf16.
++    _h3_int8_bf16_blocks = frozenset(
++        int(b) for b in os.environ.get("OMNIXPU_H3_INT8_ATTN_BF16_BLOCKS", "45,48,49").split(",") if b
++    )
++    _h3_int8_check_left = int(os.environ.get("OMNIXPU_H3_INT8_ATTN_CHECK", "0"))
++    return ""
++
++
++def _h3_int8_attention(q, k, v, transformer_options):
++    """INT8 QK^T attention for the H3 DiT blocks; None keeps the bf16 route."""
++    global _h3_int8_calls, _h3_int8_check_left
++    if torch.compiler.is_compiling():
++        return None
++    block = (transformer_options or {}).get("block_index")
++    # Only DiT blocks pass Q/K/V that all view one qkv projection (the token refiner does not).
++    if block is None or block in _h3_int8_bf16_blocks or any(t.stride(2) != 3 * 56 * 128 for t in (q, k, v)):
++        return None
++    q8, k8, q_scale, k_scale = _h3_int8_ops.quant_qk(q, k)
++    out = _h3_int8_ops.fmha(q8, k8, v, q_scale, k_scale)
++    _h3_int8_calls += 1
++    if _h3_int8_check_left > 0:
++        _h3_int8_check_left -= 1
++        ref = _backend_sdp.sdp_bhld_d128(q, k, v).float()
++        err = ((out.float() - ref).norm() / ref.norm()).item()
++        cos = torch.nn.functional.cosine_similarity(out.float(), ref, dim=-1).min().item()
++        log.info("[OmniXPU] H3 int8 attention check: block=%d rel_err=%.4f min_cos=%.4f", block, err, cos)
++    return out
++
++
+ def _is_minimax_h3_vae_d64_bhld(tensor, seq, *, value):
+     try:
+         shape = tuple(tensor.shape)
+@@ -692,6 +737,14 @@ def apply():
+ 
+     _pytorch_fallback = attn_mod.attention_pytorch
+     wrap_attn = attn_mod.wrap_attn
++    if target == "bmg" and _backend_name == "cute":
++        int8_reason = _load_h3_int8_sidecar(
++            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(attn_mod.__file__)))))
++        )
++        if int8_reason:
++            log.info("[OmniXPU] attention: H3 int8 QK route off (%s)", int8_reason)
++        else:
++            log.info("[OmniXPU] attention: H3 int8 QK route enabled")
+ 
+     @wrap_attn
+     def attention_omni(
+@@ -970,9 +1023,15 @@ def apply():
+             )
+             _, q_bhld, k_bhld, v_bhld = bmg_d128_prepared
+             try:
+-                out = _backend_sdp.sdp_bhld_d128(
+-                    q_bhld, k_bhld, v_bhld
+-                )
++                out = None
++                if heads == 56 and _h3_int8_ops is not None:
++                    out = _h3_int8_attention(
++                        q_bhld, k_bhld, v_bhld, kwargs.get("transformer_options")
++                    )
++                if out is None:
++                    out = _backend_sdp.sdp_bhld_d128(
++                        q_bhld, k_bhld, v_bhld
++                    )
+                 if skip_output_reshape:
+                     return out
+                 return out.transpose(1, 2).reshape(
