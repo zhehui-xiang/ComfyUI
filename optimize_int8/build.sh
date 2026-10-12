@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 在 llm-scaler-omni 容器里执行（ComfyUI 挂在 /workspace/ComfyUI）：
-#   build  : 编译 h3_int8_attn.cpp -> optimize_int8/build/h3_int8_attn.so（源文件没变就跳过）
+#   build  : 编译 h3_int8_attn.cpp -> optimize_int8/build/h3_int8_attn.so
+#            build/h3_int8_attn.so.stamp 记录源文件、build.sh、AOT_TARGET、编译器版本的哈希，一致才跳过
 #   patch  : 把 patches/*.patch 打到 custom_nodes/ComfyUI-OmniXPU（已打过就跳过，冲突则报错）；
 #            patch 改的是 ../optimize 融合 patch 之后的 h3_rms_modulation.py，要先打融合 patch
 #   revert : 撤掉 patch（要在 ../optimize/build.sh revert 之前）
@@ -11,11 +12,16 @@ dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 comfy_root="$(dirname "$dir")"
 omnixpu="$comfy_root/custom_nodes/ComfyUI-OmniXPU"
 so="$dir/build/h3_int8_attn.so"
+stamp="$so.stamp"
 AOT_TARGET=${AOT_TARGET:-bmg-g21,bmg-g31}  # B580/B60 + B70
 CUTLASS_SYCL_ROOT=${CUTLASS_SYCL_ROOT:-/llm/sycl-tla}
 
 step_build() {
-  if [[ -f $so && $so -nt $dir/h3_int8_attn.cpp && $so -nt $dir/int8_qk_fmha.hpp && $so -nt $dir/build.sh ]]; then
+  # 不用 mtime：.so 在 git 里，checkout 后的时间戳不反映内容；只改 AOT_TARGET 时源文件也没变
+  local want
+  want=$({ cat "$dir/h3_int8_attn.cpp" "$dir/int8_qk_fmha.hpp" "$dir/build.sh"
+           echo "AOT_TARGET=$AOT_TARGET"; icpx --version | head -1; } | sha256sum | cut -d' ' -f1)
+  if [[ -f $so && -f $stamp && $(<"$stamp") == "$want" ]]; then
     echo "[optimize_int8] $so is up to date"
     return
   fi
@@ -28,6 +34,7 @@ print(include_paths()[0], os.path.join(os.path.dirname(torch.__file__), "lib"),
 PY
 )
   echo "[optimize_int8] building $so (AOT $AOT_TARGET)"
+  rm -f "$so.tmp"   # 上次失败留下的 tmp 不能被当成这次的产物
   # 编译参数同 omni_xpu_kernel/setup.py 的 cute_fmha_torch
   icpx -fsycl -std=c++17 -O3 -DNDEBUG -fPIC -shared \
     -fsycl-targets=spir64_gen -Xsycl-target-backend "-device $AOT_TARGET" \
@@ -46,6 +53,7 @@ PY
     -o "$so.tmp" "$dir/h3_int8_attn.cpp" 2>&1 | grep -vE "^(Compilation from IR|Build succeeded)" || true
   [[ -f $so.tmp ]] || { echo "[optimize_int8] build failed" >&2; exit 1; }
   mv "$so.tmp" "$so"
+  echo "$want" > "$stamp"
   [[ -n ${HOST_UID:-} ]] && chown -R "$HOST_UID:${HOST_GID:-$HOST_UID}" "$dir/build"
   echo "[optimize_int8] built $so"
 }

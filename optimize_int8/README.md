@@ -8,8 +8,8 @@ q/k 的 rms_rope 和 INT8 量化合成一个 kernel，不再把 bf16 Q/K 写回 
 | 文件 | 作用 |
 |---|---|
 | `h3_int8_attn.cpp` | 注册 `torch.ops.h3i8attn.rms_rope_quant`（rms_rope + Q 逐 token / K 每 32 token 一个 scale 的 INT8 量化）和 `fmha`（INT8 QKᵀ FMHA） |
-| `int8_qk_fmha.hpp` | FMHA 的 mainloop / kernel，基于 sycl-tla `flash_attention_v2` 的 XeDefault 改写，不修改 sycl-tla |
-| `build.sh` | 容器内执行：编译 `build/h3_int8_attn.so`（源码没变则跳过）+ 打 patch（已打则跳过，融合 patch 没打则报错）；`revert` 撤 patch |
+| `int8_qk_fmha.hpp` | FMHA 的 mainloop / kernel，基于 sycl-tla `flash_attention_v2` 的 XeDefault 改写，不修改 sycl-tla；mainloop 优化见 `/home/test/xzh/prof_an/qk_mainloop` |
+| `build.sh` | 容器内执行：编译 `build/h3_int8_attn.so` + 打 patch（已打则跳过，融合 patch 没打则报错）；`revert` 撤 patch。`build/h3_int8_attn.so.stamp` 是源文件、`build.sh`、`AOT_TARGET`、编译器版本的哈希，一致才跳过编译（和 `.so` 一起提交） |
 | `patches/0001-omnixpu-h3-int8-attention.patch` | ComfyUI-OmniXPU `adapters/h3_rms_modulation.py`（融合 patch 之后）：满足条件的 block 走 `rms_rope_quant` + `fmha`，否则走原 rms_rope + 选中的 attention |
 
 ## 使用
@@ -44,7 +44,7 @@ H3_INT8_ATTN_CHECK=100 bash run_headless_minimax_h3.sh  # 前 100 次 INT8 atten
 | | 原 bf16 | 单独量化（上一版） | rms_rope 融合量化（当前） |
 |---|---|---|---|
 | rms_rope / 量化 | 2.66 ms | 2.66 + 1.37 ms | 1.76 ms |
-| attention | 56.3 ms | 51.0 ms | 51.0 ms |
+| attention | 56.3 ms | 51.0 ms | 51.0 ms → 43.0 ms（mainloop 优化） |
 
 端到端（GPU 1 上同一张卡前后连续跑；这张卡的基线比 GPU 0 慢约 7%，绝对值不能跨卡比）：
 
@@ -53,11 +53,19 @@ H3_INT8_ATTN_CHECK=100 bash run_headless_minimax_h3.sh  # 前 100 次 INT8 atten
 | 稳态每次 H3 forward（第 3~20 次） | 5.726 s | 5.366 s（−6.3%） |
 | 整个 workflow | 154.6 s | 147.8 s |
 
-- `H3_INT8_ATTN_CHECK` 检查全部 20 步 × 47 个 INT8 block：相对误差最大 1.64%、平均 0.82%，最差 token cos 0.983。
+mainloop 优化（反量化并进 softmax FMA、MMA-K 循环编译期展开、最后一个 KV tile 单独 mask）前后，GPU 0 上连续跑：
+
+| | 改前 | 改后（两次） |
+|---|---|---|
+| 稳态每次 H3 forward（第 3~20 次） | 5.040 s | 4.641 / 4.650 s（−7.8%） |
+| 整个 workflow | 138.8 s | 130.8 / 132.3 s |
+
+改前改后 attention 输出只差 bf16 舍入（相对 8e-5，最大差 1 ulp）。
+
+- `H3_INT8_ATTN_CHECK` 检查全部 20 步 × 47 个 INT8 block：相对误差最大 1.65%、平均 0.83%，最差 token cos 0.980（mainloop 优化前 1.64% / 0.82% / 0.983）。
 - 视频：INT8 两次运行之间 PSNR 19.8 dB，INT8 vs bf16 20.7 dB，在流水线本身不可复现的噪声范围内。
 
 ## 还没做的
 
 - `rms_rope_quant` 1.76 ms，只算量化不做 rope 的下限是 1.36 ms，按读写字节数的理想值约 0.7 ms。
-- QKᵀ 本身：kernel 里 INT8 QKᵀ 约 17 ms，按实测 int8 峰值理想值 10.6 ms（Q 每个 KV tile 都重新从 L1 读）。
 - 只在 B70 上调过配置和验证过；AOT 同时编了 `bmg-g21`（B580/B60），未在这些卡上测试。

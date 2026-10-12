@@ -248,6 +248,20 @@
       "title": "Float (duration)"
     }
   },
+  "140:134": {
+    "inputs": {
+      "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+      "strength_model": 1,
+      "model": [
+        "140:127",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
   "140:135": {
     "inputs": {
       "switch": [
@@ -256,6 +270,10 @@
       ],
       "on_false": [
         "140:127",
+        0
+      ],
+      "on_true": [
+        "140:134",
         0
       ]
     },
@@ -295,7 +313,7 @@
   },
   "140:138": {
     "inputs": {
-      "value": 20
+      "value": 8
     },
     "class_type": "PrimitiveInt",
     "_meta": {

@@ -1,5 +1,7 @@
 // INT8 QKᵀ 的 FMHA：Q/K 是预先量化好的 int8，S = Q·Kᵀ 走 int8 DPAS（int32 累加），
 // 反量化 S = s32 · q_scale[行] · k_scale[KV tile] 后做 online softmax，P·V 仍是 bf16 DPAS。
+// 反量化并进 softmax 的 FMA；head_dim 方向的 MMA-K 循环是编译期常量；最后一个 KV tile 单独处理越界 mask
+// （分析见 /home/test/xzh/prof_an/qk_mainloop）。
 //
 // 基于 sycl-tla applications/flash_attention_v2 的 XeDefault mainloop 和 XeFMHAFwdKernel 改写
 // （非 causal、无 KV cache / paged / varlen），不修改 sycl-tla 本身；epilogue 直接复用 FMHAFwdEpilogue。
@@ -148,8 +150,14 @@ struct Int8QKMainloop {
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tQs.size(); i++) {
       int row = q0 + get<0>(cS_thread(i));
-      tQs(i) = row < seq_len ? q_scale[row] : 0.0f;
+      tQs(i) = row < seq_len ? q_scale[row] : 1.0f;   // 越界行读到的 Q 是 0；scale 不能是 0，否则乘 -inf 得 NaN
     }
+    // 同一行的 tQs 都相同，按行归约成 FragSRow，并入 softmax scale
+    auto tQsRow = reduce<1>(tQs, sycl::maximum{});
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tQsRow.size(); i++) tQsRow(i) *= params.scale;
+
+    constexpr int NumD = get<1>(TileShapePV{}) * VTiles / get<2>(TileShapeQK{});   // head_dim 方向的 MMA-K 步数
 
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_,_,_,D));
@@ -168,13 +176,14 @@ struct Int8QKMainloop {
 
     const bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
-    for (int K = blk_k0; K < blk_k1; K++) {
+    // Mask: 这一轮是否可能是不满的最后一个 KV tile
+    auto body = [&](int K, auto Mask) {
       barrier_arrive(ScopeWorkgroup);
 
       /* GEMM 1: S = Q · Kᵀ，int8 -> int32 */
       clear(tSrSi);
       CUTLASS_PRAGMA_UNROLL
-      for (int D = 0; D < size<4>(tKgK); D++) {
+      for (int D = 0; D < NumD; D++) {
         copy(copy_q, tQgQ(_,_,_,D), tQrQ);
         copy(copy_k, tKgK(_,_,_,K,D), tKrK);
         reorder(tQrQ, tSrQ);
@@ -187,15 +196,15 @@ struct Int8QKMainloop {
         prefetch(prefetch_v, pVgV(_,_,_,VV,K));
       }
 
-      /* 反量化：行 scale × 当前 KV tile 的 scale */
-      const float ks = k_scale[K];
+      /* 反量化：行 scale × 当前 KV tile 的 scale，在 softmax 的 FMA 里乘 */
+      FragSRow rowscale;
       CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < tSrS.size(); i++) {
-        tSrS(i) = float(tSrSi(i)) * (tQs(i) * ks);
-      }
+      for (int i = 0; i < rowscale.size(); i++) rowscale(i) = tQsRow(i) * k_scale[K];
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tSrS.size(); i++) tSrS(i) = float(tSrSi(i));
 
       /* 最后一个不满的 KV tile：越界的列置 -inf（坐标取法同 BMG overlay） */
-      if (check_remainder_k && K == blk_k1 - 1) {
+      if (decltype(Mask)::value && check_remainder_k) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tSrS.size(); ++i) {
           if (K * get<1>(TileShapeQK{}) + get<1>(cS_thread(i)) >= seq_len) {
@@ -204,7 +213,7 @@ struct Int8QKMainloop {
         }
       }
 
-      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
+      auto rescale = softmax(K == blk_k0, tSrS, rowscale, tA_max, tA_sum);
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P · V，bf16 */
@@ -224,22 +233,26 @@ struct Int8QKMainloop {
         prefetch(prefetch_k, pKgK(_,_,_,K + Stages,D));
       }
       barrier_wait(ScopeWorkgroup);
-    }
+    };
+
+    for (int K = blk_k0; K < blk_k1 - 1; K++) body(K, std::false_type{});
+    if (blk_k1 > blk_k0) body(blk_k1 - 1, std::true_type{});
   }
 
-  // 与 XeDefault mainloop 相同的 online softmax
-  CUTLASS_DEVICE FragSRow softmax(bool first_block, FragS& tS, FragSRow& tS_max, FragSRow& tS_sum) {
+  // 与 XeDefault mainloop 相同的 online softmax，只是 scale 按行给出（rowscale > 0）
+  CUTLASS_DEVICE FragSRow softmax(bool first_block, FragS& tS, FragSRow const& rowscale,
+                                  FragSRow& tS_max, FragSRow& tS_sum) {
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
     FragSRow rescale;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
-      ElementS new_max = sycl::max(tS_max(i), params.scale * tS_bmax(i));
+      ElementS new_max = sycl::max(tS_max(i), rowscale(i) * tS_bmax(i));
       rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
       tS_max(i) = new_max;
     }
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
-      tS(i) = sycl::native::exp2(params.scale * tS(i) - broadcast<0>(tS_max, tS, i));
+      tS(i) = sycl::native::exp2(broadcast<0>(rowscale, tS, i) * tS(i) - broadcast<0>(tS_max, tS, i));
     if (!first_block) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tS_sum.size(); i++) tS_sum(i) *= rescale(i);
