@@ -2,12 +2,13 @@
 set -euo pipefail
 
 gpu=${GPU:-0}
+test=${TEST:-"base"}
 
-container_name="comfyui-omni-minimax-h3-gpu$gpu"
+container_name="comfyui-omni-minimax-h3-gpu-$test"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 host_root="$SCRIPT_PATH/.."
 
-mkdir -p "$host_root/comfyui-omni/gpu$gpu-output" "$host_root/comfyui-omni/gpu$gpu-user"
+mkdir -p "$host_root/comfyui-omni/gpu-$test-output" "$host_root/comfyui-omni/gpu-$test-user"
 docker rm -f "$container_name" >/dev/null 2>&1 || true
 
 # 先在容器里跑 optimize/build.sh（编译 h3_fused.so + 给 ComfyUI-OmniXPU 打 patch，均幂等），再跑 headless。
@@ -34,8 +35,8 @@ docker run --rm \
   -e H3_AB_FORWARD="${H3_AB_FORWARD:-3}" \
   -v "$host_root/../ComfyUI/models:/models/host:ro" \
   -v "$host_root/ComfyUI:/workspace/ComfyUI:rw" \
-  -v "$host_root/comfyui-omni/gpu$gpu-output:/data/output" \
-  -v "$host_root/comfyui-omni/gpu$gpu-user:/data/user" \
+  -v "$host_root/comfyui-omni/gpu-$test-output:/data/output" \
+  -v "$host_root/comfyui-omni/gpu-$test-user:/data/user" \
   -v /dev/dri/by-path:/dev/dri/by-path --shm-size=32g \
   --workdir=/workspace/ComfyUI \
   --entrypoint bash \
