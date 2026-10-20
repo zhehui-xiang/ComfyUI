@@ -112,6 +112,27 @@ def update_seeds(prompt, run_number):
             inputs["noise_seed"] += RUNNER_ARGS.seed_step * (run_number - 1)
 
 
+def h3_fusion_stats():
+    """Cumulative ComfyUI-OmniXPU H3 route counters, or None if the adapter is not loaded."""
+    for name, module in list(sys.modules.items()):
+        if name.endswith("adapters.h3_rms_modulation") and hasattr(module, "get_stats"):
+            return module.get_stats()
+    return None
+
+
+def stats_delta(after, before):
+    """Per-run difference of get_stats() counters (ints and per-reason dicts)."""
+    delta = {}
+    for key, value in after.items():
+        old = (before or {}).get(key)
+        if isinstance(value, dict):
+            old = old or {}
+            delta[key] = {r: n - old.get(r, 0) for r, n in value.items() if n - old.get(r, 0)}
+        else:
+            delta[key] = value - (old or 0)
+    return delta
+
+
 async def execute_prompt(executor, prompt, run_number):
     from execution import validate_prompt
 
@@ -121,9 +142,15 @@ async def execute_prompt(executor, prompt, run_number):
         raise RuntimeError(f"Workflow validation failed: {error['message']}: {error['details']}")
     executor.server.timed_node_id = None
     executor.server.last_event_time = None
+    stats_before = h3_fusion_stats()
     start = time.time_ns()
     await executor.execute_async(prompt, prompt_id, {"client_id": executor.server.client_id}, outputs)
     end = time.time_ns()
+    stats_after = h3_fusion_stats()
+    if stats_after is not None:
+        # Main-process DiT only; with Raylight the DiT runs in workers, which print their own H3_FUSION_STATS.
+        logging.getLogger("headless_timing").info(
+            "H3_FUSION_STATS/ run=%d %s", run_number, json.dumps(stats_delta(stats_after, stats_before), sort_keys=True))
     if executor.server.timed_node_id is not None:
         log_timing(f"NODE_TIMING/ last node={executor.server.timed_node_id}", executor.server.last_event_time, end)
     log_timing(
@@ -211,6 +238,9 @@ async def main():
         return output
 
     MiniMaxH3Model.forward = timed_forward
+    # Raylight runs the DiT in Ray workers, where the patch above does not exist; this makes
+    # each worker print the same H3_FORWARD line (with its rank). Read when RayInitializer runs.
+    os.environ.setdefault("RAYLIGHT_H3_FORWARD_TIMING", "1")
     prompt = load_api_prompt(os.path.abspath(RUNNER_ARGS.workflow))
     executor = PromptExecutor(
         HeadlessServer(),

@@ -247,10 +247,12 @@ struct Int8QKTile {
   using SubgroupLayoutQK = Layout<Shape<Int<kSgQ>, _1, _1>>;
   static constexpr int AtomM = cute::gcd(kQTile / kSgQ, 8);
 
-  using StrideQ = Stride<int, _1, int, int>;
-  using StrideK = Stride<int, _1, int, int>;
-  using StrideV = Stride<_1, int, int, int>;
-  using StrideO = Stride<int, _1, int, int>;
+  // Batch stride is int64: V is a view into the packed qkv buffer, so it spans
+  // L * 3 * H * 128 elements and passes 2^31 above ~99.8k tokens (H3 15 s video).
+  using StrideQ = Stride<int, _1, int, int64_t>;
+  using StrideK = Stride<int, _1, int, int64_t>;
+  using StrideV = Stride<_1, int, int, int64_t>;
+  using StrideO = Stride<int, _1, int, int64_t>;
 
   using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<AtomM, int32_t, int8_t, int8_t>>,
                                              Layout<ShapeQK>, SubgroupLayoutQK>::TiledMMA;
@@ -283,7 +285,7 @@ int checked_int(int64_t value, const char* label) {
 template <typename S>
 S seq_major_stride(const at::Tensor& t) {
   return cute::make_stride(checked_int(t.stride(2), "seq stride"), _1{},
-                           checked_int(t.stride(1), "head stride"), checked_int(t.stride(0), "batch stride"));
+                           checked_int(t.stride(1), "head stride"), static_cast<int64_t>(t.stride(0)));
 }
 
 at::Tensor fmha(const at::Tensor& q8, const at::Tensor& k8, const at::Tensor& v,
@@ -311,7 +313,7 @@ at::Tensor fmha(const at::Tensor& q8, const at::Tensor& k8, const at::Tensor& v,
 
   typename KT::StrideV stride_v = cute::make_stride(
       _1{}, checked_int(v.stride(2), "V seq stride"), checked_int(v.stride(1), "V head stride"),
-      checked_int(v.stride(0), "V batch stride"));
+      static_cast<int64_t>(v.stride(0)));
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
